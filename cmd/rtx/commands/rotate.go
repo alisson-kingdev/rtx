@@ -2,7 +2,7 @@ package commands
 
 import (
 	"fmt"
-	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -10,45 +10,53 @@ import (
 	"rtx/src/utils"
 )
 
-var rotateCmd = &cobra.Command{
-	Use:   "rotate",
-	Short: "Executar rotacao de IP",
-	Long:  "Rotaciona o IP usando proxies publicas coletadas de APIs",
-	Run: func(cmd *cobra.Command, args []string) {
-		isVerbose, _ := cmd.Flags().GetBool("verbose")
-		if isVerbose {
-			fmt.Println(utils.Info("Modo verboso ativado"))
-		}
+func newRotateCmd() *cobra.Command {
+	var opts rotationOptions
 
-		fmt.Println(utils.Banner())
+	cmd := &cobra.Command{
+		Use:   "rotate",
+		Short: "Executar rotação de IP",
+		Long:  "Rotaciona o IP usando proxies públicas coletadas de APIs gratuitas, com fallback para APIs diretas.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			out := cmd.OutOrStdout()
+			if isVerbose(cmd) {
+				fmt.Fprintln(out, utils.Info("Modo verboso ativado"))
+			}
 
-		fmt.Println(utils.Section("Obtendo IP antigo (IP real)"))
-		result := controllers.RotateIP()
+			fmt.Fprintln(out, utils.Banner())
+			fmt.Fprintln(out, utils.Section("Obtendo IP antigo (IP real)"))
 
-		if result.Error != nil {
-			fmt.Println(utils.Error(fmt.Sprintf("Erro ao executar rotacao: %v", result.Error)))
-			os.Exit(1)
-		}
+			result, err := controllers.RotateIP(cmd.Context(), opts.config())
+			if err != nil {
+				return fmt.Errorf("executar rotação: %w", err)
+			}
 
-		fmt.Println(utils.Success(fmt.Sprintf("IP Antigo: %s", result.OldIP)))
+			fmt.Fprintln(out, utils.Success(fmt.Sprintf("IP Antigo: %s", result.OldIP)))
+			fmt.Fprintln(out, utils.Section("Rotacionando IP via proxies públicas"))
+			fmt.Fprintln(out, utils.Colorize(utils.CyanColor, "========================================"))
+			fmt.Fprintln(out, utils.Colorize(utils.MagentaColor, "        RESULTADO DA ROTAÇÃO"))
+			proxyDisplay := result.Proxy
+			if strings.Contains(proxyDisplay, "://") {
+				proxyDisplay = utils.RedactURL(proxyDisplay)
+			}
+			fmt.Fprintln(out, utils.Colorize(utils.CyanColor, "========================================"))
+			fmt.Fprint(out, utils.PrintKV("Proxy URL", proxyDisplay))
+			fmt.Fprint(out, utils.PrintKV("Proxy Source", result.Source))
+			fmt.Fprint(out, utils.PrintKV("IP Antigo", result.OldIP))
+			fmt.Fprint(out, utils.PrintKV("IP Novo", result.NewIP))
+			fmt.Fprintln(out, utils.Colorize(utils.CyanColor, "========================================"))
 
-		fmt.Println(utils.Section("Rotacionando IP via proxies publicas"))
+			if result.Changed {
+				fmt.Fprintln(out, utils.Success("IP rotacionado com sucesso!"))
+			} else {
+				fmt.Fprintln(out, utils.Warning("O IP não mudou após a rotação."))
+			}
+			fmt.Fprintln(out, utils.Colorize(utils.MagentaColor, "[*] Script finalizado."))
+			return nil
+		},
+	}
 
-		fmt.Println(utils.Colorize(utils.CyanColor, "========================================"))
-		fmt.Println(utils.Colorize(utils.MagentaColor, "        RESULTADO DA ROTACAO"))
-		fmt.Println(utils.Colorize(utils.CyanColor, "========================================"))
-		utils.PrintKV("Proxy URL", result.Proxy)
-		utils.PrintKV("Proxy Source", result.Source)
-		utils.PrintKV("IP Antigo", result.OldIP)
-		utils.PrintKV("IP Novo", result.NewIP)
-		fmt.Println(utils.Colorize(utils.CyanColor, "========================================"))
-
-		if result.Changed {
-			fmt.Println(utils.Success("IP rotacionado com sucesso!"))
-		} else {
-			fmt.Println(utils.Warning("O IP nao mudou apos a rotacao."))
-		}
-
-		fmt.Println(utils.Colorize(utils.MagentaColor, "[*] Script finalizado."))
-	},
+	addRotationFlags(cmd, &opts)
+	return cmd
 }

@@ -1,6 +1,8 @@
 package services
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +11,7 @@ import (
 	"strings"
 
 	"rtx/src/models"
+	"rtx/src/utils"
 )
 
 const (
@@ -28,6 +31,9 @@ func shellConfigFiles(shell string) []string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil
+	}
+	if resolved, err := filepath.EvalSymlinks(home); err == nil {
+		home = resolved
 	}
 
 	var files []string
@@ -59,116 +65,238 @@ func shellConfigFiles(shell string) []string {
 		}
 	}
 
-	// Adicionar /etc/environment para Linux (sistema-wide)
-	if runtime.GOOS == "linux" {
-		files = append(files, "/etc/environment")
-	}
-
 	return files
 }
 
-func proxyEnvLines(proxyURL string, shell string) []string {
-	// Normalizar: garantir http:// prefixo se não tiver esquema
-	normalized := proxyURL
-	if !strings.HasPrefix(normalized, "http://") && !strings.HasPrefix(normalized, "https://") {
-		normalized = "http://" + normalized
+func proxyEnvLines(proxyURL string, shell string) ([]string, error) {
+	normalized, err := utils.NormalizeProxyURL(proxyURL)
+	if err != nil {
+		return nil, err
 	}
-
-	noProxy := "localhost,127.0.0.1,::1,.local,.internal"
+	quoted := utils.ShellQuote(normalized)
+	noProxy := utils.ShellQuote("localhost,127.0.0.1,::1,.local,.internal")
 
 	if shell == "fish" {
 		return []string{
 			rtxProxyMarkerStart,
-			fmt.Sprintf("set -gx http_proxy %s", normalized),
-			fmt.Sprintf("set -gx https_proxy %s", normalized),
-			fmt.Sprintf("set -gx HTTP_PROXY %s", normalized),
-			fmt.Sprintf("set -gx HTTPS_PROXY %s", normalized),
+			fmt.Sprintf("set -gx http_proxy %s", quoted),
+			fmt.Sprintf("set -gx https_proxy %s", quoted),
+			fmt.Sprintf("set -gx HTTP_PROXY %s", quoted),
+			fmt.Sprintf("set -gx HTTPS_PROXY %s", quoted),
 			fmt.Sprintf("set -gx no_proxy %s", noProxy),
 			fmt.Sprintf("set -gx NO_PROXY %s", noProxy),
 			rtxProxyMarkerEnd,
-		}
+		}, nil
 	}
 
 	return []string{
 		rtxProxyMarkerStart,
-		fmt.Sprintf("export http_proxy=%s", normalized),
-		fmt.Sprintf("export https_proxy=%s", normalized),
-		fmt.Sprintf("export HTTP_PROXY=%s", normalized),
-		fmt.Sprintf("export HTTPS_PROXY=%s", normalized),
+		fmt.Sprintf("export http_proxy=%s", quoted),
+		fmt.Sprintf("export https_proxy=%s", quoted),
+		fmt.Sprintf("export HTTP_PROXY=%s", quoted),
+		fmt.Sprintf("export HTTPS_PROXY=%s", quoted),
 		fmt.Sprintf("export no_proxy=%s", noProxy),
 		fmt.Sprintf("export NO_PROXY=%s", noProxy),
 		rtxProxyMarkerEnd,
-	}
+	}, nil
 }
 
-func removeRTXBlock(content string) string {
+// removeRTXBlock removes complete RTX-managed blocks without deleting
+// surrounding user configuration. An unterminated marker is left untouched.
+func removeRTXBlock(content string) (string, bool) {
 	lines := strings.Split(content, "\n")
-	var result []string
-	insideBlock := false
+	kept := make([]string, 0, len(lines))
+	removed := false
 
-	for _, line := range lines {
-		if strings.Contains(line, rtxProxyMarkerStart) {
-			insideBlock = true
+	for i := 0; i < len(lines); {
+		if strings.TrimSpace(lines[i]) != rtxProxyMarkerStart {
+			kept = append(kept, lines[i])
+			i++
 			continue
 		}
-		if strings.Contains(line, rtxProxyMarkerEnd) {
-			insideBlock = false
+
+		end := -1
+		for j := i + 1; j < len(lines); j++ {
+			trimmed := strings.TrimSpace(lines[j])
+			if trimmed == rtxProxyMarkerEnd {
+				end = j
+				break
+			}
+			if trimmed == rtxProxyMarkerStart {
+				break
+			}
+		}
+		if end < 0 {
+			kept = append(kept, lines[i])
+			i++
 			continue
 		}
-		if !insideBlock {
-			result = append(result, line)
-		}
+
+		i = end + 1
+		removed = true
 	}
 
-	return strings.Join(result, "\n")
+	result := strings.Join(kept, "\n")
+	if removed {
+		result = strings.TrimRight(result, "\n")
+	}
+	return result, removed
 }
 
-func writeProxyToFile(filePath string, proxyURL string, shell string) error {
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Criar arquivo novo apenas com o bloco RTX
-			lines := proxyEnvLines(proxyURL, shell)
-			return os.WriteFile(filePath, []byte(strings.Join(lines, "\n")+"\n"), 0644)
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+
+	existing, err := os.Lstat(path)
+	switch {
+	case err == nil:
+		if existing.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to write through symlink %s", path)
 		}
-		return err
+		if !existing.Mode().IsRegular() {
+			return fmt.Errorf("refusing to write to non-regular file %s", path)
+		}
+		mode = existing.Mode().Perm()
+	case errors.Is(err, os.ErrNotExist):
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create directory %s: %w", dir, err)
+		}
+	default:
+		return fmt.Errorf("inspect %s: %w", path, err)
 	}
 
-	// Remover bloco anterior se existir
-	cleaned := removeRTXBlock(string(content))
+	tmp, err := os.CreateTemp(dir, ".rtx-tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary file in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	keepTemp := true
+	defer func() {
+		if keepTemp {
+			_ = os.Remove(tmpName)
+		}
+	}()
 
-	// Limpar linhas vazias duplicadas no final
-	cleaned = strings.TrimRight(cleaned, "\n")
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("set permissions on temporary file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temporary file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temporary file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temporary file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("replace %s: %w", path, err)
+	}
 
-	// Adicionar novo bloco
-	newBlock := strings.Join(proxyEnvLines(proxyURL, shell), "\n")
-
-	final := cleaned + "\n\n" + newBlock + "\n"
-
-	return os.WriteFile(filePath, []byte(final), 0644)
+	keepTemp = false
+	return nil
 }
 
-func unsetProxyFromFile(filePath string, shell string) (bool, error) {
-	content, err := os.ReadFile(filePath)
+func writeProxyToFile(filePath string, proxyURL string, shell string) (bool, error) {
+	lines, err := proxyEnvLines(proxyURL, shell)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
 		return false, err
 	}
 
-	cleaned := removeRTXBlock(string(content))
+	content, err := os.ReadFile(filePath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("read %s: %w", filePath, err)
+	}
 
-	if string(content) == cleaned {
-		return false, nil // nada foi removido
+	cleaned, _ := removeRTXBlock(string(content))
+	cleaned = strings.TrimRight(cleaned, "\n")
+
+	block := strings.Join(lines, "\n")
+	final := block + "\n"
+	if cleaned != "" {
+		final = cleaned + "\n\n" + block + "\n"
+	}
+	if string(content) == final {
+		return false, nil
+	}
+
+	if err := writeFileAtomic(filePath, []byte(final), 0o600); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func unsetProxyFromFile(filePath string) (bool, error) {
+	content, err := os.ReadFile(filePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", filePath, err)
+	}
+
+	cleaned, removed := removeRTXBlock(string(content))
+	if !removed {
+		return false, nil
 	}
 
 	cleaned = strings.TrimRight(cleaned, "\n")
-	return true, os.WriteFile(filePath, []byte(cleaned+"\n"), 0644)
+	final := cleaned
+	if final != "" {
+		final += "\n"
+	}
+	if string(content) == final {
+		return false, nil
+	}
+	if err := writeFileAtomic(filePath, []byte(final), 0o600); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-func setSystemProxyWindows(proxyURL string) error {
-	normalized := normalizeProxyURL(proxyURL)
+func applyProxyToShellFiles(proxyURL, shell string) ([]string, error) {
+	var (
+		updated []string
+		errs    []error
+	)
+	for _, file := range shellConfigFiles(shell) {
+		changed, err := writeProxyToFile(file, proxyURL, shell)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", file, err))
+			continue
+		}
+		if changed {
+			updated = append(updated, file)
+		}
+	}
+	return updated, errors.Join(errs...)
+}
+
+func removeProxyFromShellFiles() ([]string, error) {
+	var (
+		updated []string
+		errs    []error
+	)
+	for _, file := range shellConfigFiles(detectShell()) {
+		removed, err := unsetProxyFromFile(file)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", file, err))
+			continue
+		}
+		if removed {
+			updated = append(updated, file)
+		}
+	}
+	return updated, errors.Join(errs...)
+}
+
+func setSystemProxyWindows(ctx context.Context, proxyURL string) error {
+	normalized, err := utils.NormalizeProxyURL(proxyURL)
+	if err != nil {
+		return err
+	}
 	noProxy := "localhost,127.0.0.1"
 
 	vars := []struct {
@@ -184,223 +312,210 @@ func setSystemProxyWindows(proxyURL string) error {
 	}
 
 	for _, v := range vars {
-		cmd := exec.Command("setx", v.name, v.value)
-		if err := cmd.Run(); err != nil {
+		if err := exec.CommandContext(ctx, "setx", v.name, v.value).Run(); err != nil {
 			return fmt.Errorf("setx %s: %w", v.name, err)
 		}
 	}
 
-	cmd := exec.Command("netsh", "winhttp", "set", "proxy",
-		fmt.Sprintf("proxy-server=\"%s\"", normalized),
-		"bypass-list=\"localhost;127.0.0.1;*.local;*.internal\"")
+	cmd := exec.CommandContext(ctx, "netsh", "winhttp", "set", "proxy",
+		fmt.Sprintf("proxy-server=%q", normalized),
+		"bypass-list=localhost;127.0.0.1;*.local;*.internal")
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("netsh winhttp: %w", err)
 	}
-
 	return nil
 }
 
-func unsetSystemProxyWindows() error {
+func unsetSystemProxyWindows(ctx context.Context) error {
 	vars := []string{"http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY"}
-
-	for _, v := range vars {
-		cmd := exec.Command("setx", v, "")
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("setx %s: %w", v, err)
+	for _, name := range vars {
+		if err := exec.CommandContext(ctx, "setx", name, "").Run(); err != nil {
+			return fmt.Errorf("setx %s: %w", name, err)
 		}
 	}
-
-	cmd := exec.Command("netsh", "winhttp", "reset", "proxy")
-	if err := cmd.Run(); err != nil {
+	if err := exec.CommandContext(ctx, "netsh", "winhttp", "reset", "proxy").Run(); err != nil {
 		return fmt.Errorf("netsh reset: %w", err)
 	}
-
 	return nil
 }
 
-func normalizeProxyURL(proxyURL string) string {
-	if !strings.HasPrefix(proxyURL, "http://") && !strings.HasPrefix(proxyURL, "https://") {
-		return "http://" + proxyURL
+func networkServices(ctx context.Context) ([]string, error) {
+	out, err := exec.CommandContext(ctx, "networksetup", "-listallnetworkservices").Output()
+	if err != nil {
+		return nil, fmt.Errorf("networksetup list: %w", err)
 	}
-	return proxyURL
+
+	var services []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "*" || strings.HasPrefix(line, "An asterisk") {
+			continue
+		}
+		services = append(services, line)
+	}
+	return services, nil
 }
 
-func setSystemProxyMacOS(proxyURL string, networkService string) error {
-	normalized := normalizeProxyURL(proxyURL)
-	hostPort := strings.TrimPrefix(normalized, "http://")
-	hostPort = strings.TrimPrefix(hostPort, "https://")
-	parts := strings.Split(hostPort, ":")
-	host := parts[0]
-	port := "8080"
-	if len(parts) > 1 {
-		port = parts[1]
+func validateNetworkService(service string) error {
+	if service == "" {
+		return nil
+	}
+	if strings.HasPrefix(service, "-") || strings.ContainsAny(service, "\r\n\t") {
+		return fmt.Errorf("invalid network service name %q", service)
+	}
+	return nil
+}
+
+func setSystemProxyMacOS(ctx context.Context, proxyURL string, networkService string) error {
+	if err := validateNetworkService(networkService); err != nil {
+		return err
+	}
+
+	parsed, err := utils.ParseProxyURL(proxyURL)
+	if err != nil {
+		return err
+	}
+	if parsed.User != nil {
+		return errors.New("authenticated proxies are not supported by networksetup")
+	}
+
+	host := parsed.Hostname()
+	port := parsed.Port()
+	if host == "" || port == "" {
+		return errors.New("proxy URL must include a host and port")
 	}
 
 	services := []string{networkService}
 	if networkService == "" {
-		out, err := exec.Command("networksetup", "-listallnetworkservices").Output()
+		services, err = networkServices(ctx)
 		if err != nil {
-			return fmt.Errorf("networksetup list: %w", err)
+			return err
 		}
-		for _, line := range strings.Split(string(out), "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" && line != "*" && !strings.HasPrefix(line, "An asterisk") {
-				services = append(services, line)
+	}
+
+	for _, service := range services {
+		commands := [][]string{
+			{"-setwebproxy", service, host, port},
+			{"-setsecurewebproxy", service, host, port},
+			{"-setwebproxystate", service, "on"},
+			{"-setsecurewebproxystate", service, "on"},
+		}
+		for _, args := range commands {
+			if err := exec.CommandContext(ctx, "networksetup", args...).Run(); err != nil {
+				return fmt.Errorf("networksetup %s %s: %w", args[0], service, err)
 			}
 		}
 	}
-
-	for _, svc := range services {
-		if err := exec.Command("networksetup", "-setwebproxy", svc, host, port).Run(); err != nil {
-			return fmt.Errorf("networksetup setwebproxy %s: %w", svc, err)
-		}
-		if err := exec.Command("networksetup", "-setsecurewebproxy", svc, host, port).Run(); err != nil {
-			return fmt.Errorf("networksetup setsecurewebproxy %s: %w", svc, err)
-		}
-		if err := exec.Command("networksetup", "-setwebproxystate", svc, "on").Run(); err != nil {
-			return fmt.Errorf("networksetup webproxystate %s: %w", svc, err)
-		}
-		if err := exec.Command("networksetup", "-setsecurewebproxystate", svc, "on").Run(); err != nil {
-			return fmt.Errorf("networksetup secureproxystate %s: %w", svc, err)
-		}
-	}
-
 	return nil
 }
 
-func unsetSystemProxyMacOS(networkService string) error {
+func unsetSystemProxyMacOS(ctx context.Context, networkService string) error {
+	if err := validateNetworkService(networkService); err != nil {
+		return err
+	}
+
 	services := []string{networkService}
 	if networkService == "" {
-		out, err := exec.Command("networksetup", "-listallnetworkservices").Output()
+		var err error
+		services, err = networkServices(ctx)
 		if err != nil {
-			return fmt.Errorf("networksetup list: %w", err)
+			return err
 		}
-		for _, line := range strings.Split(string(out), "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" && line != "*" && !strings.HasPrefix(line, "An asterisk") {
-				services = append(services, line)
+	}
+
+	for _, service := range services {
+		commands := [][]string{
+			{"-setwebproxystate", service, "off"},
+			{"-setsecurewebproxystate", service, "off"},
+		}
+		for _, args := range commands {
+			if err := exec.CommandContext(ctx, "networksetup", args...).Run(); err != nil {
+				return fmt.Errorf("networksetup %s %s: %w", args[0], service, err)
 			}
 		}
 	}
-
-	for _, svc := range services {
-		if err := exec.Command("networksetup", "-setwebproxystate", svc, "off").Run(); err != nil {
-			return fmt.Errorf("networksetup webproxystate off %s: %w", svc, err)
-		}
-		if err := exec.Command("networksetup", "-setsecurewebproxystate", svc, "off").Run(); err != nil {
-			return fmt.Errorf("networksetup secureproxystate off %s: %w", svc, err)
-		}
-	}
-
 	return nil
 }
 
-func SetSystemProxy(proxyURL string) models.SystemProxyResult {
+// SetSystemProxy applies a validated proxy to the current user's shell
+// configuration and, where supported, to OS-level network settings.
+func SetSystemProxy(ctx context.Context, proxyURL string) (models.SystemProxyResult, error) {
+	if err := ctx.Err(); err != nil {
+		return models.SystemProxyResult{}, err
+	}
+	normalized, err := utils.NormalizeProxyURL(proxyURL)
+	if err != nil {
+		return models.SystemProxyResult{}, fmt.Errorf("validate proxy URL: %w", err)
+	}
+
 	result := models.SystemProxyResult{
 		Action:       "set",
-		ProxyURL:     proxyURL,
-		Success:      false,
+		ProxyURL:     utils.RedactURL(normalized),
+		Shell:        detectShell(),
 		FilesUpdated: []string{},
 	}
 
-	shell := detectShell()
-	result.Shell = shell
-
 	switch runtime.GOOS {
 	case "windows":
-		if err := setSystemProxyWindows(proxyURL); err != nil {
-			result.Error = err
-			return result
+		if err := setSystemProxyWindows(ctx, normalized); err != nil {
+			return result, err
 		}
-		result.Success = true
 		result.FilesUpdated = []string{"Windows Environment Variables (setx)", "WinHTTP"}
-		return result
+		return result, nil
 
 	case "darwin":
-		// Tentar networksetup (precisa de sudo em alguns casos)
-		if err := setSystemProxyMacOS(proxyURL, ""); err != nil {
-			result.Error = err
-			return result
+		if err := setSystemProxyMacOS(ctx, normalized, ""); err != nil {
+			return result, err
 		}
-		// Também escrever nos arquivos de shell para CLI tools
-		files := shellConfigFiles(shell)
-		updated := []string{}
-		for _, f := range files {
-			if _, err := unsetProxyFromFile(f, shell); err == nil {
-				// removido ou nao existia, agora escreve
-			}
-			if err := writeProxyToFile(f, proxyURL, shell); err == nil {
-				updated = append(updated, f)
-			}
-		}
-		result.Success = true
+		updated, err := applyProxyToShellFiles(normalized, result.Shell)
 		result.FilesUpdated = updated
-		return result
+		return result, err
 
-	default: // linux, android (termux), freebsd, etc.
-		files := shellConfigFiles(shell)
-		updated := []string{}
-		for _, f := range files {
-			if err := writeProxyToFile(f, proxyURL, shell); err == nil {
-				updated = append(updated, f)
-			}
+	default:
+		updated, err := applyProxyToShellFiles(normalized, result.Shell)
+		result.FilesUpdated = updated
+		if err != nil {
+			return result, err
 		}
 		if len(updated) == 0 {
-			result.Error = fmt.Errorf("nenhum arquivo de configuracao de shell encontrado para escrever")
-			return result
+			return result, errors.New("no shell configuration file could be updated")
 		}
-		result.Success = true
-		result.FilesUpdated = updated
-		return result
+		return result, nil
 	}
 }
 
-func UnsetSystemProxy() models.SystemProxyResult {
+// UnsetSystemProxy removes RTX-managed proxy settings from the user's shell
+// configuration and resets OS-level network settings where supported.
+func UnsetSystemProxy(ctx context.Context) (models.SystemProxyResult, error) {
+	if err := ctx.Err(); err != nil {
+		return models.SystemProxyResult{}, err
+	}
+
 	result := models.SystemProxyResult{
 		Action:       "unset",
-		Success:      false,
+		Shell:        detectShell(),
 		FilesUpdated: []string{},
 	}
 
-	shell := detectShell()
-	result.Shell = shell
-
 	switch runtime.GOOS {
 	case "windows":
-		if err := unsetSystemProxyWindows(); err != nil {
-			result.Error = err
-			return result
+		if err := unsetSystemProxyWindows(ctx); err != nil {
+			return result, err
 		}
-		result.Success = true
 		result.FilesUpdated = []string{"Windows Environment Variables (setx)", "WinHTTP"}
-		return result
+		return result, nil
 
 	case "darwin":
-		if err := unsetSystemProxyMacOS(""); err != nil {
-			result.Error = err
-			return result
+		if err := unsetSystemProxyMacOS(ctx, ""); err != nil {
+			return result, err
 		}
-		files := shellConfigFiles(shell)
-		updated := []string{}
-		for _, f := range files {
-			if removed, _ := unsetProxyFromFile(f, shell); removed {
-				updated = append(updated, f)
-			}
-		}
-		result.Success = true
+		updated, err := removeProxyFromShellFiles()
 		result.FilesUpdated = updated
-		return result
+		return result, err
 
 	default:
-		files := shellConfigFiles(shell)
-		updated := []string{}
-		for _, f := range files {
-			if removed, _ := unsetProxyFromFile(f, shell); removed {
-				updated = append(updated, f)
-			}
-		}
-		result.Success = true
+		updated, err := removeProxyFromShellFiles()
 		result.FilesUpdated = updated
-		return result
+		return result, err
 	}
 }

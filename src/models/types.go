@@ -1,23 +1,16 @@
 package models
 
+// Proxy represents a proxy candidate collected from a public source.
 type Proxy struct {
 	URL    string
 	Source string
 }
 
-type IPInfo struct {
-	OldIP       string
-	NewIP       string
-	ProxyURL    string
-	ProxySource string
-	Success     bool
-}
-
+// RotationResult describes the outcome of an IP rotation attempt.
 type RotationResult struct {
 	OldIP   string
 	NewIP   string
 	Proxy   string
 	Source  string
 	Changed bool
-	Error   error
 }

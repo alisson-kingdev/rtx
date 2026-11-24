@@ -1,96 +1,102 @@
 package services
 
 import (
+	"context"
 	"errors"
 	"testing"
+
+	"rtx/src/models"
 )
 
-func TestCollectProxies_Success(t *testing.T) {
-	origFetch := collectFetchURLFn
-	defer func() { collectFetchURLFn = origFetch }()
+func TestProxyCollectorCollect(t *testing.T) {
+	t.Parallel()
 
-	collectFetchURLFn = func(url string) (string, error) {
-		switch url {
-		case "https://gimmeproxy.com/api/getProxy?curl=true":
-			return "http://1.1.1.1:8080\nhttp://2.2.2.2:8080\n", nil
-		case "https://hproxy.com/api/proxy-list?format=json":
-			return `{"proxies":[{"proxy":"http://3.3.3.3:8080"}]}`, nil
-		case "https://api.proxyscraper.com/v1/http.txt":
-			return "4.4.4.4:3128\nhttp://5.5.5.5:8080\n", nil
-		}
-		return "", errors.New("fail")
+	tests := []struct {
+		name      string
+		responses map[string]string
+		wantURLs  []string
+		wantErr   bool
+	}{
+		{
+			name: "text and JSON sources",
+			responses: map[string]string{
+				"https://gimmeproxy.test":   "http://1.1.1.1:8080\n2.2.2.2:3128\n",
+				"https://hproxy.test":       `{"proxies":[{"proxy":"http://3.3.3.3:8080"}]}`,
+				"https://proxyscraper.test": "4.4.4.4:3128\nhttp://1.1.1.1:8080\n",
+			},
+			wantURLs: []string{"http://1.1.1.1:8080", "http://2.2.2.2:3128", "http://3.3.3.3:8080", "http://4.4.4.4:3128"},
+		},
+		{
+			name: "invalid candidates are ignored",
+			responses: map[string]string{
+				"https://gimmeproxy.test": "http://proxy;rm -rf /:8080\nhttp://5.5.5.5:8080\n",
+			},
+			wantURLs: []string{"http://5.5.5.5:8080"},
+		},
+		{
+			name: "all sources fail",
+			responses: map[string]string{
+				"https://gimmeproxy.test": "",
+			},
+			wantErr: true,
+		},
 	}
 
-	proxies := CollectProxies()
-	if len(proxies) != 5 {
-		t.Fatalf("expected 5 proxies, got %d", len(proxies))
+	sources := []ProxySource{
+		{Name: "gimmeproxy", URL: "https://gimmeproxy.test"},
+		{Name: "hproxy", URL: "https://hproxy.test"},
+		{Name: "proxyscraper", URL: "https://proxyscraper.test"},
 	}
-	if proxies[0].URL != "http://1.1.1.1:8080" {
-		t.Errorf("expected http://1.1.1.1:8080, got %s", proxies[0].URL)
-	}
-	if proxies[0].Source != "gimmeproxy" {
-		t.Errorf("expected source gimmeproxy, got %s", proxies[0].Source)
-	}
-	if proxies[2].URL != "http://3.3.3.3:8080" || proxies[2].Source != "hproxy" {
-		t.Errorf("expected hproxy entry, got %+v", proxies[2])
-	}
-	if proxies[4].URL != "http://5.5.5.5:8080" {
-		t.Errorf("expected http://5.5.5.5:8080, got %s", proxies[4].URL)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fetcher := &stubFetcher{fetch: func(_ context.Context, url string) ([]byte, error) {
+				body, ok := tc.responses[url]
+				if !ok || body == "" {
+					return nil, errors.New("source unavailable")
+				}
+				return []byte(body), nil
+			}}
+			collector := NewProxyCollector(fetcher, sources, 0)
+
+			got, err := collector.Collect(context.Background())
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Collect() = %v, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Collect() failed: %v", err)
+			}
+			if len(got) != len(tc.wantURLs) {
+				t.Fatalf("Collect() returned %d proxies, want %d: %+v", len(got), len(tc.wantURLs), got)
+			}
+			for i, want := range tc.wantURLs {
+				if got[i].URL != want {
+					t.Errorf("proxy[%d].URL = %q, want %q", i, got[i].URL, want)
+				}
+			}
+		})
 	}
 }
 
-func TestCollectProxies_AllFail(t *testing.T) {
-	origFetch := collectFetchURLFn
-	defer func() { collectFetchURLFn = origFetch }()
+func TestProxyCollectorRespectsLimit(t *testing.T) {
+	t.Parallel()
 
-	collectFetchURLFn = func(url string) (string, error) {
-		return "", errors.New("fail")
+	fetcher := &stubFetcher{fetch: func(_ context.Context, _ string) ([]byte, error) {
+		return []byte("http://1.1.1.1:8080\nhttp://2.2.2.2:8080\nhttp://3.3.3.3:8080\n"), nil
+	}}
+	collector := NewProxyCollector(fetcher, []ProxySource{{Name: "test", URL: "https://proxy.test"}}, 2)
+
+	got, err := collector.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect() failed: %v", err)
 	}
-
-	proxies := CollectProxies()
-	if len(proxies) != 0 {
-		t.Fatalf("expected 0 proxies, got %d", len(proxies))
+	if len(got) != 2 {
+		t.Fatalf("Collect() returned %d proxies, want 2", len(got))
 	}
-}
-
-func TestCollectProxies_EmptyBody(t *testing.T) {
-	origFetch := collectFetchURLFn
-	defer func() { collectFetchURLFn = origFetch }()
-
-	collectFetchURLFn = func(url string) (string, error) {
-		return "", nil
-	}
-
-	proxies := CollectProxies()
-	if len(proxies) != 0 {
-		t.Fatalf("expected 0 proxies, got %d", len(proxies))
-	}
-}
-
-func TestCollectProxies_PartialFailure(t *testing.T) {
-	origFetch := collectFetchURLFn
-	defer func() { collectFetchURLFn = origFetch }()
-
-	collectFetchURLFn = func(url string) (string, error) {
-		switch url {
-		case "https://gimmeproxy.com/api/getProxy?curl=true":
-			return "http://1.1.1.1:8080\n", nil
-		case "https://hproxy.com/api/proxy-list?format=json":
-			return "", errors.New("fail")
-		case "https://api.proxyscraper.com/v1/http.txt":
-			return "2.2.2.2:8080\n", nil
-		}
-		return "", errors.New("fail")
-	}
-
-	proxies := CollectProxies()
-	if len(proxies) != 2 {
-		t.Fatalf("expected 2 proxies, got %d", len(proxies))
-	}
-	if proxies[0].Source != "gimmeproxy" {
-		t.Errorf("expected source gimmeproxy, got %s", proxies[0].Source)
-	}
-	if proxies[1].Source != "proxyscraper" {
-		t.Errorf("expected source proxyscraper, got %s", proxies[1].Source)
+	if got[0] != (models.Proxy{URL: "http://1.1.1.1:8080", Source: "test"}) {
+		t.Errorf("unexpected first proxy: %+v", got[0])
 	}
 }

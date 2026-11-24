@@ -73,9 +73,9 @@ func (c *HTTPClient) do(ctx context.Context, targetURL string, proxy *url.URL) (
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	defer transport.CloseIdleConnections()
 	if proxy != nil {
 		transport.Proxy = http.ProxyURL(proxy)
-		defer transport.CloseIdleConnections()
 	}
 
 	client := &http.Client{

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
+	"os/signal"
 
 	"github.com/spf13/cobra"
 
@@ -9,27 +12,32 @@ import (
 	"rtx/src/utils"
 )
 
-var (
-	verbose bool
-)
+// version can be overridden at build time with -ldflags "-X main.version=...".
+var version = utils.GetVersion()
 
-var rootCmd = &cobra.Command{
-	Use:   "rtx",
-	Short: "RTX - Rotacionador de IP usando proxies publicas",
-	Long:  utils.Banner(),
-	Run: func(cmd *cobra.Command, args []string) {
-		_ = cmd.Help()
-	},
+func newRootCmd() *cobra.Command {
+	root := &cobra.Command{
+		Use:           "rtx",
+		Short:         "RTX - Rotacionador de IP usando proxies públicas",
+		Long:          utils.Banner(),
+		Version:       version,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return cmd.Help()
+		},
+	}
+	root.PersistentFlags().BoolP("verbose", "v", false, "Ativar modo verboso")
+	commands.Register(root)
+	return root
 }
 
 func main() {
-	if err := rootCmd.Execute(); err != nil {
-		utils.RedColor.Print(err.Error())
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	if err := newRootCmd().ExecuteContext(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, utils.Error(err.Error()))
 		os.Exit(1)
 	}
-}
-
-func init() {
-	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Ativar modo verboso")
-	commands.Register(rootCmd)
 }
