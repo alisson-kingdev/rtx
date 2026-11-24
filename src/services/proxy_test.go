@@ -22,8 +22,8 @@ func TestCollectProxies_Success(t *testing.T) {
 	}
 
 	proxies := CollectProxies()
-	if len(proxies) != 4 {
-		t.Fatalf("expected 4 proxies, got %d", len(proxies))
+	if len(proxies) != 5 {
+		t.Fatalf("expected 5 proxies, got %d", len(proxies))
 	}
 	if proxies[0].URL != "http://1.1.1.1:8080" {
 		t.Errorf("expected http://1.1.1.1:8080, got %s", proxies[0].URL)
@@ -31,8 +31,11 @@ func TestCollectProxies_Success(t *testing.T) {
 	if proxies[0].Source != "gimmeproxy" {
 		t.Errorf("expected source gimmeproxy, got %s", proxies[0].Source)
 	}
-	if proxies[3].URL != "http://5.5.5.5:8080" {
-		t.Errorf("expected http://5.5.5.5:8080, got %s", proxies[3].URL)
+	if proxies[2].URL != "http://3.3.3.3:8080" || proxies[2].Source != "hproxy" {
+		t.Errorf("expected hproxy entry, got %+v", proxies[2])
+	}
+	if proxies[4].URL != "http://5.5.5.5:8080" {
+		t.Errorf("expected http://5.5.5.5:8080, got %s", proxies[4].URL)
 	}
 }
 
