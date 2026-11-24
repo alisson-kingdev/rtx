@@ -1,10 +1,13 @@
-.PHONY: all build clean test help
+.PHONY: all build build-all clean test install help
 
 # Configuracao
 BINARY_NAME := rtx
 MAIN_PATH := ./cmd/rtx
 VERSION := 1.0.0
 BUILD_DIR := build
+
+# O projeto nao usa cgo; desabilita-lo mantem o cross-compile portatil.
+CGO_ENABLED := 0
 
 # Flags de build
 LDFLAGS := -s -w -X main.version=$(VERSION)
@@ -17,8 +20,7 @@ PLATFORMS := \
     darwin/amd64 \
     darwin/arm64 \
     windows/amd64 \
-    android/arm64 \
-    android/arm
+    android/arm64
 
 all: help
 
@@ -35,7 +37,7 @@ help:
 build:
 	@echo ">> Build para plataforma atual"
 	@mkdir -p $(BUILD_DIR)
-	@go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME) $(MAIN_PATH)
+	@CGO_ENABLED=$(CGO_ENABLED) go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME) $(MAIN_PATH)
 
 build-all: clean
 	@echo ">> Build cross-plataforma para todas as plataformas"
@@ -49,9 +51,7 @@ build-all: clean
 			output="$$output.exe"; \
 		fi; \
 		echo "   -> $$os/$$arch"; \
-		GOOS=$$os GOARCH=$$arch go build -ldflags "$(LDFLAGS)" -o $$output $(MAIN_PATH) || { \
-			echo "   !! Falha: $$os/$$arch"; \
-		}; \
+		CGO_ENABLED=$(CGO_ENABLED) GOOS=$$os GOARCH=$$arch go build -ldflags "$(LDFLAGS)" -o $$output $(MAIN_PATH) || exit 1; \
 	done
 	@echo ""
 	@echo ">> Build concluido em $(BUILD_DIR)/"
