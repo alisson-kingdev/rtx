@@ -143,8 +143,35 @@ func removeRTXBlock(content string) (string, bool) {
 	return result, removed
 }
 
+func ensureDirectoryWithinHome(dir string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil // Best effort: the target symlink is still checked below.
+	}
+	home, err = filepath.EvalSymlinks(home)
+	if err != nil {
+		return nil
+	}
+
+	resolved, err := filepath.EvalSymlinks(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		resolved = dir
+	} else if err != nil {
+		return fmt.Errorf("resolve directory %s: %w", dir, err)
+	}
+
+	rel, err := filepath.Rel(home, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("refusing to write outside home directory: %s", dir)
+	}
+	return nil
+}
+
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
+	if err := ensureDirectoryWithinHome(dir); err != nil {
+		return err
+	}
 
 	existing, err := os.Lstat(path)
 	switch {
@@ -349,6 +376,9 @@ func networkServices(ctx context.Context) ([]string, error) {
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || line == "*" || strings.HasPrefix(line, "An asterisk") {
+			continue
+		}
+		if err := validateNetworkService(line); err != nil {
 			continue
 		}
 		services = append(services, line)

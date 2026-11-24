@@ -146,6 +146,31 @@ func TestSetAndUnsetSystemProxy(t *testing.T) {
 	}
 }
 
+func TestSetSystemProxyRejectsSymlinkedParent(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("shell configuration test is Linux-specific")
+	}
+
+	home := t.TempDir()
+	outside := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/usr/bin/fish")
+
+	if err := os.MkdirAll(filepath.Join(outside, "fish"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(home, ".config")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	if _, err := SetSystemProxy(context.Background(), "http://proxy.example.com:8080"); err == nil {
+		t.Fatal("SetSystemProxy() wrote through a symlinked parent directory")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "fish", "config.fish")); !os.IsNotExist(err) {
+		t.Errorf("config.fish was created outside the home directory: %v", err)
+	}
+}
+
 func TestSetSystemProxyRejectsMaliciousURL(t *testing.T) {
 	t.Parallel()
 
