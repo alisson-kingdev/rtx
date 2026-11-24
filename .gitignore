@@ -1,0 +1,19 @@
+# Binários e artefatos de build
+/rtx
+/rtx.exe
+/build/
+/dist/
+
+# Cobertura e perfis
+*.out
+coverage.txt
+*.prof
+
+# IDE e editores
+.idea/
+.vscode/
+*.swp
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
